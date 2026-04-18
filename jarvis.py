@@ -170,35 +170,27 @@ def run_voice() -> None:
     """
     Voice mode.
     Overlay (tkinter) runs on the main thread.
-    Wake word listener + audio processing run on background threads.
+    Single persistent audio stream + state machine runs on background threads.
     """
     from agent import chat
-    from tools.voice_input import (
-        listen_for_wake_word,
-        record_until_silence,
-        transcribe,
-        wake_word_available,
-    )
+    from tools.voice_input import run_voice_loop, wake_word_available
     from tools.voice_output import speak, speak_async
     from tools.overlay import JarvisOverlay, State as OState
 
     _start_scheduler()
     history = load_recent_history(config.HISTORY_LIMIT)
-    _recording_lock = threading.Lock()
+    _lock = threading.Lock()
     overlay = JarvisOverlay()
 
-    def process_audio() -> None:
+    def on_wake() -> None:
+        overlay.set_state(OState.LISTENING)
+        speak_async(f"Yes, {config.USER_NAME}?")
+
+    def on_command(text: str) -> None:
         nonlocal history
-        if not _recording_lock.acquire(blocking=False):
+        if not _lock.acquire(blocking=False):
             return
         try:
-            overlay.set_state(OState.LISTENING)
-            console.print("[voice]◉ Recording...[/voice]")
-            audio = record_until_silence()
-            text  = transcribe(audio)
-            if not text:
-                console.print("[info](silence detected)[/info]")
-                return
             console.print(f"[user]{config.USER_NAME.capitalize()}:[/user] {text}")
             overlay.set_state(OState.THINKING)
             reply, history = chat(
@@ -213,9 +205,11 @@ def run_voice() -> None:
             console.print(f"[error]Voice error: {exc}[/error]")
         finally:
             overlay.set_state(OState.STANDBY)
-            _recording_lock.release()
+            _lock.release()
 
     console.print(f"[jarvis]{BANNER}[/jarvis]")
+
+    stop_event = threading.Event()
 
     def _voice_thread() -> None:
         if wake_word_available():
@@ -225,12 +219,10 @@ def run_voice() -> None:
                 border_style="magenta",
             ))
             speak_async(f"J.A.R.V.I.S. online. Say Jarvis to begin, {config.USER_NAME}.")
-            stop_event = threading.Event()
             try:
-                listen_for_wake_word(
-                    on_detected=lambda: threading.Thread(
-                        target=process_audio, daemon=True
-                    ).start(),
+                run_voice_loop(
+                    on_command=on_command,
+                    on_wake=on_wake,
                     stop_event=stop_event,
                 )
             except KeyboardInterrupt:
@@ -241,14 +233,23 @@ def run_voice() -> None:
                 "Press [bold]Enter[/bold] to speak · [bold]Ctrl+C[/bold] to exit.",
                 border_style="magenta",
             ))
+            from tools.voice_input import record_until_silence, transcribe
             speak_async(f"J.A.R.V.I.S. online. Press Enter to speak, {config.USER_NAME}.")
-            while True:
+            while not stop_event.is_set():
                 try:
                     console.print("\n[info]Press Enter to speak...[/info]")
                     input()
                     speak_async("Listening.")
-                    process_audio()
+                    overlay.set_state(OState.LISTENING)
+                    audio = record_until_silence()
+                    text = transcribe(audio)
+                    if text:
+                        threading.Thread(target=on_command, args=(text,), daemon=True).start()
+                    else:
+                        console.print("[info](silence detected)[/info]")
+                        overlay.set_state(OState.STANDBY)
                 except (KeyboardInterrupt, EOFError):
+                    stop_event.set()
                     break
 
         speak_async(f"Goodbye, {config.USER_NAME}.")
